@@ -66,7 +66,7 @@ class Tests(unittest.TestCase):
         src = "para one\n\npara two\n\npara three"
         client = ScriptedClient(edits(("one", "1")), "bad", "bad", "bad")
         with self.assertRaises(d.UpdateFailed):
-            d.update_document(src, ["x"], client, chunk_words=2, workers=1)
+            d.update_document(src, ["x"], client, unit_words=2, window_words=2, workers=1)
 
     def test_no_op_is_not_success(self):
         with self.assertRaises(d.UpdateFailed):
@@ -99,6 +99,53 @@ class Tests(unittest.TestCase):
         resp = edits(("Basic costs $10", "Basic costs $11"), ("Pro costs $20", "Pro costs $24"))
         doc, _ = d.update_document(src, ["Increase all prices by 10%."], ScriptedClient(resp), workers=1)
         self.assertEqual(doc, "Basic costs $11 per month. Pro costs $24 per month.")  # expected $22
+
+
+class RetrievalTests(unittest.TestCase):
+    NL = chr(10)
+
+    def long_doc(self, n=60):
+        nl = self.NL * 2
+        paras = [f"## Topic {i}{nl}Filler paragraph number {i} about gardening and weather. " + "lorem ipsum " * 40
+                 for i in range(n)]
+        paras[min(37, n - 1)] = f"## Pricing{nl}Basic costs $10 per month. Pro costs $20 per month."
+        return nl.join(paras)
+
+    def test_targeted_sends_small_fraction_and_preserves_rest(self):
+        src = self.long_doc()
+        client = ScriptedClient(edits(("Basic costs $10", "Basic costs $11")))
+        doc, st = d.update_document(src, ["Raise the Basic pricing."], client, workers=1)
+        self.assertEqual(st.mode, "targeted")
+        self.assertEqual(client.calls, 1)
+        self.assertLess(st.words_sent, 0.15 * st.words_total)
+        self.assertEqual(doc, src.replace("Basic costs $10", "Basic costs $11"))
+
+    def test_sent_words_independent_of_document_size(self):
+        sent = []
+        for n in (60, 240):
+            _, st = d.update_document(self.long_doc(n), ["Raise Basic pricing."], ScriptedClient(
+                edits(("Basic costs $10", "Basic costs $11"))), workers=1)
+            sent.append(st.words_sent)
+        self.assertEqual(sent[0], sent[1])
+
+    def test_global_instruction_sends_everything(self):
+        src = self.long_doc(10)
+        client = ScriptedClient(*[edits() for _ in range(50)])
+        with self.assertRaises(d.UpdateFailed):  # empty edits => no-op failure, but every window was sent
+            d.update_document(src, ["Make the tone throughout more formal."], client, workers=1)
+        self.assertEqual(client.calls, len(d.chunk_document(src, 1500)))
+
+    def test_no_lexical_hit_falls_back_to_full_scan(self):
+        import selector
+        src = self.long_doc(10)
+        self.assertEqual(selector.select(d.chunk_document(src, 250), ["Zzyzx qqq."])[1], "fallback-full")
+
+    def test_matched_heading_pulls_in_its_section(self):
+        import selector
+        units = ["## Pricing", "Basic costs $10.", "Pro costs $20.", "## Other", "Unrelated."]
+        wanted, _ = selector.select(units, ["Update the pricing section."])
+        self.assertTrue(wanted[1] and wanted[2])
+        self.assertFalse(wanted[4])
 
 
 if __name__ == "__main__":

@@ -18,6 +18,8 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
+import selector
+
 CHUNK_WORDS = 1500        # target words per chunk (paragraph-aligned)
 MAX_ATTEMPTS = 3          # model attempts per chunk (1 initial + 2 corrective retries)
 MAX_TRANSPORT_RETRIES = 3 # HTTP 429/5xx/network retries per call
@@ -162,7 +164,10 @@ def build_messages(chunk: str, changes: list[str]) -> list[dict]:
 # --------------------------------------------------------------------------- orchestration
 @dataclass
 class Stats:
-    chunks: int = 0
+    chunks: int = 0           # model windows sent
+    mode: str = ""
+    words_total: int = 0
+    words_sent: int = 0
     model_calls: int = 0
     retries: int = 0
     edits_applied: int = 0
@@ -196,28 +201,40 @@ def update_chunk(client, chunk: str, changes: list[str], idx: int, stats: Stats)
     raise UpdateFailed(f"chunk {idx} failed after {MAX_ATTEMPTS} attempts; last error: {last_err}")
 
 
-def update_document(source: str, changes: list[str], client, chunk_words: int = CHUNK_WORDS,
-                    workers: int = WORKERS) -> tuple[str, Stats]:
-    """All-or-nothing: returns the full updated document or raises UpdateFailed."""
+def update_document(source: str, changes: list[str], client, unit_words: int = selector.UNIT_WORDS,
+                    window_words: int = selector.WINDOW_WORDS, workers: int = WORKERS,
+                    retrieval: bool = True) -> tuple[str, Stats]:
+    """All-or-nothing: returns the full updated document or raises UpdateFailed.
+
+    retrieval=True: BM25 selects the parts relevant to each instruction; only those are sent.
+    retrieval=False: every window of the document is sent with every instruction.
+    """
     if not isinstance(source, str) or not source.strip():
         raise UpdateFailed("sourceDocument must be a non-empty string.")
     if (not isinstance(changes, list) or not changes
             or not all(isinstance(c, str) and c.strip() for c in changes)):
         raise UpdateFailed("changes must be a non-empty list of non-empty strings.")
-    chunks = chunk_document(source, chunk_words)
-    stats = Stats(chunks=len(chunks))
+    if retrieval:
+        units = chunk_document(source, unit_words)
+        wanted, mode = selector.select(units, changes)
+    else:
+        units = chunk_document(source, window_words)
+        wanted, mode = [set(range(len(changes))) for _ in units], "full"
+    segs = selector.plan(units, wanted, window_words)
+    stats = Stats(mode=mode, words_total=len(source.split()))
+    jobs = [(i, t, [changes[j] for j in sorted(w)]) for i, (t, w) in enumerate(segs) if w]
+    stats.chunks = len(jobs)
+    stats.words_sent = sum(len(t.split()) for _, t, _ in jobs)
     with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
-        futures = [pool.submit(update_chunk, client, c, changes, i, stats) for i, c in enumerate(chunks)]
-        results = []
+        futures = {i: pool.submit(update_chunk, client, t, ch, i, stats) for i, t, ch in jobs}
         try:
-            for f in futures:
-                results.append(f.result())  # first failure aborts the whole job
+            done = {i: f.result() for i, f in futures.items()}  # first failure aborts the whole job
         except BaseException:
-            for f in futures:
+            for f in futures.values():
                 f.cancel()
             raise
-    stats.edits_applied = sum(n for _, n in results)
-    result = "".join(t for t, _ in results)
+    stats.edits_applied = sum(n for _, n in done.values())
+    result = "".join(done[i][0] if i in done else t for i, (t, _) in enumerate(segs))
     if result == source:
         raise UpdateFailed("model proposed no effective changes; refusing to report success.")
     return result, stats
@@ -227,6 +244,7 @@ def update_document(source: str, changes: list[str], client, chunk_words: int = 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Apply natural-language changes to a document via OpenAI.")
     ap.add_argument("input", help='JSON file: {"sourceDocument": "...", "changes": ["..."]}')
+    ap.add_argument("--no-retrieval", action="store_true", help="send the whole document (full scan)")
     ap.add_argument("-o", "--output", help="write result JSON here (default: stdout)")
     args = ap.parse_args(argv)
 
@@ -246,14 +264,16 @@ def main(argv=None) -> int:
             data = json.load(f)
         if not isinstance(data, dict):
             raise UpdateFailed("input must be a JSON object.")
-        doc, stats = update_document(data.get("sourceDocument"), data.get("changes"), OpenAIClient())
+        doc, stats = update_document(data.get("sourceDocument"), data.get("changes"), OpenAIClient(),
+                                  retrieval=not args.no_retrieval)
     except (OSError, json.JSONDecodeError) as e:
         return emit({"status": "error", "error": f"cannot read input: {type(e).__name__}"}, 1)
     except UpdateFailed as e:
         return emit({"status": "error", "error": str(e)}, 1)
     s = stats
     return emit({"status": "ok", "updatedDocument": doc,
-                 "stats": {"chunks": s.chunks, "modelCalls": s.model_calls, "retries": s.retries,
+                 "stats": {"mode": s.mode, "wordsTotal": s.words_total, "wordsSent": s.words_sent,
+                           "windows": s.chunks, "modelCalls": s.model_calls, "retries": s.retries,
                            "editsApplied": s.edits_applied, "promptTokens": s.prompt_tokens,
                            "completionTokens": s.completion_tokens}}, 0)
 

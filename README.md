@@ -10,6 +10,7 @@ $env:OPENAI_API_KEY = "<your key>"        # bash: export OPENAI_API_KEY=...
 
 python docupdate.py sample_input.json                 # result JSON on stdout
 python docupdate.py sample_input.json -o result.json  # or to a file (atomic write)
+python docupdate.py sample_input.json --no-retrieval  # force a full-document scan
 
 python -m unittest discover -s tests -v               # tests; no API key needed
 ```
@@ -25,7 +26,7 @@ Input:
 
 Success (exit code 0):
 ```json
-{"status": "ok", "updatedDocument": "...", "stats": {"chunks": 7, "modelCalls": 7, "retries": 0,
+{"status": "ok", "updatedDocument": "...", "stats": {"mode": "targeted", "wordsTotal": 9931, "wordsSent": 558, "windows": 1, "modelCalls": 1, "retries": 0,
   "editsApplied": 12, "promptTokens": 0, "completionTokens": 0}}
 ```
 
@@ -39,35 +40,68 @@ Failure cases: a missing key, a bad input, persistent API errors, a chunk still 
 
 **Alternative A: full-document rewrite.** Simple, and it is naturally good at global rewrites. But for a 10k-word document, output is about 13k tokens, which takes minutes. Long outputs get truncated or silently drift, and there is no cheap way to prove unrelated text was preserved (you'd have to diff and guess intent). A single failure costs the whole call.
 
-**Chosen: B, edit proposals validated and applied by the program, per chunk.**
-1. Split the document on blank-line boundaries into chunks of about 1,500 words (`''.join(chunks) == source` is asserted).
-2. For each chunk, the model sees all instructions plus that chunk and returns `{"edits": [{"find", "replace"}]}`.
-3. The program validates and applies the edits: `find` must occur verbatim exactly once, edits must not overlap, and the JSON must match the schema. Any violation sends the specific error back to the model for a corrected response (max 3 attempts per chunk, plus bounded backoff retries for 429/5xx/network errors).
-4. If **any** chunk fails, the whole job fails. Chunks are only concatenated after all succeed.
+**Chosen: B (validated edit proposals) plus classical-NLP retrieval in front of the LLM.**
 
-I did not switch approaches during implementation. I picked B up front because it makes preservation of unrelated text true by construction and gives mechanical validation.
+Pipeline:
+1. **Split** into paragraph-aligned units of about 250 words (`''.join(units) == source` is asserted).
+2. **Select (no LLM, stdlib only, `selector.py`).** This is query-focused filtering:
+   - Each instruction is tokenised (stop-words and generic editing verbs like "update" or "remove" dropped, light stemming) and scored against every unit with **BM25**.
+   - Units scoring at least 25% of the best unit are kept. The threshold is recall-biased.
+   - Neighbouring units are added as context. If a markdown heading matches, the rest of its section is added (up to about 1,200 words).
+   - **Document-wide** instructions (tone, style, "throughout", spelling, and similar markers) select every unit.
+   - An instruction with **no lexical hit** also selects every unit. We never guess "nothing relevant"; we fall back to a full scan.
+3. **Merge** adjacent selected units into windows of up to 1,500 words. Each window is sent with **only the instructions that selected it**.
+4. **Propose:** the model returns `{"edits": [{"find", "replace"}]}` for its window.
+5. **Validate and apply:** `find` must occur verbatim exactly once, edits must not overlap, and the schema must match. A violation sends the specific error back to the model (max 3 attempts per window, plus bounded backoff for 429/5xx/network errors).
+6. Unselected text is passed through byte-for-byte. If **any** window fails, the job fails. Nothing is assembled until all windows succeed.
+
+I did not switch approaches during implementation. I added the retrieval stage after re-reading the requirement to scale token usage with *relevant* content rather than document size.
+
+`--no-retrieval` forces the full scan, which is useful as an accuracy baseline.
+
+### Which NLP methods from the list I used
+| Method | Used? | Why |
+|---|---|---|
+| Normalisation, tokenisation, stop-word removal, light stemming | yes, **for retrieval only** | The text sent to the LLM is the original, unmodified |
+| Paragraph segmentation | yes | Keeps units self-contained so `find` anchors stay valid |
+| BM25 query-focused filtering | yes | The core token saver for targeted edits |
+| Section-aware expansion (heading structure) | yes | "Pricing section" must include the tiers beneath the heading |
+| Keyword fallback to full scan | yes | Protects recall |
+| Embeddings, cross-encoder rerank | no | Needs model downloads or an extra API. BM25 is enough for edit instructions, which reuse the document's own wording |
+| Extractive/abstractive summarisation, prompt compression (LLMLingua) | **no, on purpose** | Compressing the text would corrupt the exact text the model must copy into `find` and the output we return |
+| NER, coreference, topic models, zero-shot classification | no | No measurable benefit for this task, and heavy dependencies |
 
 ### Targeted vs document-wide requests
-- **Targeted** ("remove the legacy API paragraph", "+10% pricing"): most chunks return `{"edits": []}`. Output tokens are tiny, and untouched text is byte-identical.
-- **Document-wide** ("more formal"): the model must emit an edit for each affected paragraph. Chunking keeps each response bounded, and chunks run in parallel (4 workers), so no single call must produce 10k words. Accuracy is lower than a one-shot rewrite, because the model can't see other chunks. Each edited paragraph is rewritten independently, so style can vary slightly across chunks.
-- **Cross-chunk instructions** ("make section 5 consistent with section 2", "reorder sections") are a limitation. A chunk can't see the others, so these may be missed or half-applied. Full rewrite would handle them better. This is the main accuracy cost of choosing B.
+- **Targeted** ("remove the legacy API paragraph", "+10% pricing"): only about 2-3 units are sent, usually one call. The rest of the document is untouched and byte-identical.
+- **Document-wide** ("more formal"): all windows are sent, in parallel (4 workers). Each response is bounded by the window size.
+- **Mixed requests:** each window receives only the instructions that selected it.
+- **Accuracy trade-offs:**
+  - The retrieval stage can **miss** a passage that needs editing but doesn't share vocabulary with the instruction (for example, "rename our flagship product" when the product is never named in the instruction). That is a silent miss. The mitigations are the recall-biased threshold, neighbour and section expansion, and the zero-hit fallback. A window can't see other windows, so cross-reference instructions ("make section 5 consistent with section 2") are weaker than a full rewrite.
+  - Words in the instruction that also appear in unrelated paragraphs (a number like "11") can pull in extra units. That costs tokens, not correctness.
 
-### Cost scaling (N words, chunk size C=1,500, k instructions)
-- Calls: about N/C, so about 7 for 10k words.
-- Input tokens: about 1.3N (the document, sent once in total) plus (N/C) × (system prompt + k instructions), which is linear in N.
-- Output tokens: proportional to the *size of the edits*. It is near zero for targeted changes and up to about 1.3N for a global rewrite. Full rewrite (A) is always about 1.3N.
-- Latency: roughly (N/C ÷ workers) × per-call latency, with each call bounded by chunk size. For A, latency grows with the full output. Each retry only re-costs one chunk.
-- Edit quality is better with more context per call. Smaller chunks mean cheaper retries but more repeated instruction overhead and less context.
+### Measured scaling (offline, synthetic doc; `words_sent` is what goes to the model)
+| Document words | Targeted: words sent / windows | Global: words sent / windows |
+|---|---|---|
+| ~1.7k | 282 / 1 | 1,741 / 2 |
+| ~9.9k | 558 / 1 | 9,931 / 7 |
+| ~40k | 558 / 1 | 39,961 / 28 |
+
+Input tokens, output tokens and latency by request type (N = document words):
+- **Targeted:** input is about 1.3 × (relevant region), which is **constant in N**. Output is the size of the edits. Latency is one or two calls. The only O(N) cost is the local BM25 pass (milliseconds, no tokens).
+- **Global:** input is about 1.3N plus a small per-window instruction overhead. Output is up to about 1.3N. Calls ≈ N/1500, run 4-way parallel, so latency ≈ ceil(N/1500/4) × per-call latency, and each call is bounded.
+- **Full rewrite (A):** input about 1.3N and output about 1.3N for every request type, with a single long serial call.
+- Retries only re-cost the one failed window.
 
 ## 4. Verification actually run
 
 | Check | Status |
 |---|---|
-| Unit tests (`python -m unittest discover -s tests -v`): 9 pass | **ran** |
+| Unit tests (`python -m unittest discover -s tests -v`): 14 pass | **ran** |
 | Targeted edit, unrelated text preserved | **ran** (stubbed model) |
 | Malformed JSON, then not-found `find`, then success | **ran** (stubbed model) |
 | Failure after retries exhausted (exactly 3 calls, bounded), one bad chunk fails the job, no-op fails | **ran** (stubbed model) |
 | CLI exit code 1 and no document on failure (no key set) | **ran** |
+| Retrieval: targeted edit sends under 15% of a 5k-word doc, `words_sent` is constant as the doc grows 4x, global instruction sends every window, zero-hit falls back to full scan, heading pulls in its section | **ran** (stubbed model) |
 | Live OpenAI smoke test | **not run**: no `OPENAI_API_KEY` was configured in this environment |
 
 The live path (`OpenAIClient`) is therefore untested against the real API. Run `python docupdate.py sample_input.json` with a key to check it.
@@ -89,6 +123,7 @@ This is verified by `test_readme_semantic_failure_example`, which feeds the resp
 **What the checks cannot establish:** the checks are all *structural*. They show the response is well-formed, that each anchor exists once, and that edits are disjoint, so the change is mechanically applicable and localized. They cannot show the edit is *correct*: that arithmetic is right, that the right passages were targeted, that all relevant passages were found (misses look the same as "nothing to change"), that tone or meaning was preserved, or that cross-chunk consistency holds. Closing that gap would need a second model pass or human review of the diff, domain-specific validators (e.g. recompute numbers), or sampling and agreement checks. None of these are implemented.
 
 ## Files
+- `selector.py`: BM25 relevance selection and window planning (no LLM)
 - `docupdate.py`: chunking, validation, application, OpenAI client, CLI
 - `sample_input.json`: example input
 - `tests/test_docupdate.py`: offline tests with a scripted model stub
