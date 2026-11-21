@@ -122,7 +122,7 @@ class Tests(unittest.TestCase):
         """A wrong-but-valid response passes every check (documented in README)."""
         src = "Basic costs $10 per month. Pro costs $20 per month."
         resp = edits(("Basic costs $10", "Basic costs $11"), ("Pro costs $20", "Pro costs $24"))
-        doc, _ = d.update_document(src, ["Increase all prices by 10%."], ScriptedClient(resp), workers=1)
+        doc, _ = d.update_document(src, ["Increase the cost of every plan by 10%."], ScriptedClient(resp), workers=1)
         self.assertEqual(doc, "Basic costs $11 per month. Pro costs $24 per month.")  # expected $22
 
 
@@ -298,6 +298,48 @@ class RenameAndWideTests(unittest.TestCase):
         client = ScriptedClient(bad, good)
         d.update_document(src, ["Raise the Pro price by 10%."], client, workers=1)
         self.assertEqual(client.calls, 2)
+
+
+class PriceAndRecoveryTests(unittest.TestCase):
+    PRICING = chr(10).join([
+        "## Monthly plans", "- **Basic**: $40 per month.", "- **Pro**: $50 per month.", "## Annual plans",
+        "- **Basic**: $400 per year.", "- **Pro**: $500 per year."])
+
+    def run_price(self, instruction):
+        out, ch = d.percent_price_change(self.PRICING, instruction)
+        return out, ch
+
+    def test_percent_price_scopes_are_exact_and_need_no_model(self):
+        out, _ = self.run_price("Raise the monthly plan prices by 10%.")
+        self.assertIn("$44 per month", out); self.assertIn("$55 per month", out)
+        self.assertIn("$400 per year", out)
+        out, _ = self.run_price("Increase only the annual tier prices by 10 percent; leave monthly prices alone.")
+        self.assertIn("$440 per year", out); self.assertIn("$40 per month", out)
+        out, _ = self.run_price("Raise the Pro price on the annual plan by 10%.")
+        self.assertIn("$550 per year", out); self.assertIn("$400 per year", out); self.assertIn("$50 per month", out)
+        out, ch = self.run_price("Increase every plan price (monthly and annual) by 10 percent.")
+        self.assertEqual(len(ch), 4); self.assertIn("$44 per month", out); self.assertIn("$550 per year", out)
+        client = ScriptedClient()
+        doc, st = d.update_document(self.PRICING, ["Raise all tier prices by 10%."], client, workers=1)
+        self.assertEqual(client.calls, 0)
+        self.assertEqual(st.mode, "deterministic")
+
+    def test_edit_starting_inside_heading_marker_is_rejected(self):
+        text = "### Legacy API" + chr(10) * 2 + "Old stuff." + chr(10) * 2 + "## Next"
+        with self.assertRaises(d.InvalidEdits):
+            d.apply_edits(text, [d.Edit("## Legacy API" + chr(10) * 2 + "Old stuff." + chr(10) * 2, "")])
+
+    def test_rewrite_leaves_unfixable_paragraph_unchanged_and_reports_it(self):
+        nl2 = chr(10) * 2
+        src = "# Guide" + nl2 + "Basic costs $10 per month, see https://x.example.com/a." + nl2 + "Hey, ya gotta try it!"
+        bad = json.dumps({"paragraphs": [{"id": 2, "text": "Basic is cheap."},
+                                         {"id": 4, "text": "Please make sure to try it."}]})
+        still_bad = json.dumps({"paragraphs": [{"id": 2, "text": "Basic is cheap."}]})
+        client = ScriptedClient(bad, still_bad, still_bad)
+        doc, st = d.update_document(src, ["Make the tone throughout more formal."], client, workers=1)
+        self.assertIn("Please make sure to try it.", doc)                       # good paragraph kept
+        self.assertIn("Basic costs $10 per month, see https://x.example.com/a.", doc)  # bad one untouched
+        self.assertTrue(any("left unchanged" in k["reason"] for k in st.skipped))
 
 
 if __name__ == "__main__":

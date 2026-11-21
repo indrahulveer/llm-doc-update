@@ -5,3 +5,5 @@ result.json
 .env
 results/
 results_full_run.log
+results2/
+results2_run.log

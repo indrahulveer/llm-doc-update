@@ -15,7 +15,9 @@ A CLI that takes `{"sourceDocument", "changes"}`, uses the OpenAI API to apply n
 6. **Per-instruction attribution.** Every edit names the instruction it serves, so an instruction that changed nothing is reported instead of silently ignored.
 7. **Grounding pre-flight** (no LLM): missing or ambiguous quoted targets, capitalised names that are not in the document, and update/change/set targets that are not in the document are skipped and reported.
 8. **Deterministic literal rename** (no tokens), including derived forms such as `nimbusdesk` in URLs.
-9. **Paragraph-id rewrite stage** for tone and other document-wide instructions, with programmatic checks that numbers, prices, URLs, code, bold terms and list markers survive.
+9. **Deterministic percent price change** (monthly / annual / named tier scope) for `$N per month|year` prices, with exact decimal arithmetic.
+10. **Per-paragraph recovery in the rewrite stage:** a paragraph that still fails validation is left unchanged and reported instead of failing the document.
+11. **Paragraph-id rewrite stage** for tone and other document-wide instructions, with programmatic checks that numbers, prices, URLs, code, bold terms and list markers survive.
 
 ## Bugs found by running the real dataset, and the fixes
 | Problem seen in live runs | Fix |
@@ -27,19 +29,22 @@ A CLI that takes `{"sourceDocument", "changes"}`, uses the OpenAI API to apply n
 | Over-selection: a stray "api" word pulled an unrelated window in, and the model invented a 42-line deletion | BM25 threshold raised from 25% to 40% of the best unit, a better stemmer (price/pricing/prices), and a relevance check that rejects large deletions sharing no word with the instruction |
 | Deleting a section left an extra blank line | Deletions collapse the blank-line run they leave |
 | Model calls failed on repeated identical sentences in the generated documents (non-unique anchors) | Duplicates are allowed only through the explicit `all` flag or the rewrite stage |
+| First full run: price edits wrong (a tier skipped, annual raised instead of monthly, mangled multi-paragraph anchor) | Percent price changes moved into code (exact arithmetic, scoped) |
+| A rewrite window failed the whole document because one paragraph dropped a number or collapsed repeated text | Per-paragraph rejection: re-ask that paragraph, else leave it unchanged and report it |
+| A deletion edit began inside a `###` heading marker and left a stray `#` | Edits may not start in the middle of a markdown marker |
 | Rate-limit retries too short | 5 retries, honouring `Retry-After` |
 | Windows console could not print non-ASCII output | UTF-8 stdout, raw bytes for `--format text` |
 
 ## Verified
-- **28 offline unit tests pass.** They cover targeted edits, malformed responses recovering, failure after retries are exhausted, one bad window failing the whole job, no-op failure, retrieval scaling, grounding checks, rename, rewrite protection, highlighting, the CLI failure exit code, and the batch runner continuing after a failure.
-- **Live run, first 20 documents:** 20/20 pass.
-- **Live run, first 55 documents:** 55/55 pass the dataset scorer. 124k prompt and 48k completion tokens, 39% of the text sent to the model, mean 6.1s and p95 23.4s per document.
+- **31 offline unit tests pass.** They cover targeted edits, malformed responses recovering, failure after retries are exhausted, one bad window failing the whole job, no-op failure, retrieval scaling, grounding checks, rename, price arithmetic and scope, rewrite protection and per-paragraph recovery, heading-marker boundaries, highlighting, the CLI failure exit code, and the batch runner continuing after a failure.
+- **Live run on all 500 dataset documents (final code, from scratch):** 497 pass, 3 clean failures (accepted by the scorer), 0 wrong outputs. 983k prompt and 432k completion tokens in total, 33% of the text sent to the model, mean 4.3s and p95 19.8s per document, 552s wall clock with 4 documents in parallel.
+- **History of the live runs:** the first full run scored 486 pass, 7 clean_fail, 7 wrong. The causes were fixed (see the table above) and the full set was re-run.
 
 ## Not verified, stated plainly
-- **The full 500 documents were not run.** The run was stopped on request after 55. Documents 56-500 are untested.
-- The fixes were developed against the first few cases, so the 55/55 result is not a blind test.
+- **Not a blind test.** The fixes were made while looking at failures from this same dataset.
 - The dataset scorer checks tone cases only for protected strings and headings. I read one tone output by eye (it looked right) and did not read the rest.
-- The grounding heuristics can skip a legitimate instruction (reported, never silent). Details are in the README's limitations.
+- The grounding heuristics can skip a legitimate instruction (always reported, never silent).
+- The deterministic price path only understands `$N per month|year`, and the rename path only literal renames.
 - Only `gpt-4o-mini` was used.
 
 ## Security

@@ -1,0 +1,22 @@
+{
+  "documents": 500,
+  "succeeded": 497,
+  "failed": 3,
+  "promptTokens": 983256,
+  "completionTokens": 432297,
+  "modelCalls": 1458,
+  "retries": 26,
+  "latencySeconds": {
+    "mean": 4.3,
+    "p50": 1.5,
+    "p95": 19.83,
+    "max": 40.57
+  },
+  "wordsTotal": 1520353,
+  "wordsSent": 499197,
+  "documentsWithSkippedInstructions": 352,
+  "failureReasons": {
+    "no instruction could be applied: #1 ambiguous: 'contact support' occurs 2 times, so the in": 3
+  },
+  "wallClockSeconds": 551.8
+}

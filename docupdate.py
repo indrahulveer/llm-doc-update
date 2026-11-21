@@ -110,6 +110,10 @@ def apply_edits(chunk: str, edits: list, mark: bool = False) -> str:
                                'or set "all": true if every occurrence must change.')
         if len(replace) > 5 * len(find) + 2000:
             raise InvalidEdits(f"edits[{i}].replace is implausibly large relative to its find.")
+        k = chunk.find(find)
+        if not every and k > 0 and find[0] in "#*" and chunk[k - 1] == find[0]:
+            raise InvalidEdits(f"edits[{i}].find starts in the middle of a markdown marker "
+                               f"({chunk[max(0, k - 3):k + 3]!r}). Start at the beginning of the line.")
         pos = 0
         while True:
             start = chunk.find(find, pos)
@@ -241,6 +245,7 @@ class Stats:
     log: list = field(default_factory=list)
     changes: dict = field(default_factory=dict)   # window idx -> [{before, after}]
     applied_by: dict = field(default_factory=dict) # instruction number -> edits attributed to it
+    rewrite_left_unchanged: int = 0
     skipped: list = field(default_factory=list)   # [{instruction, text, reason}] not sent / not applied
     highlighted: str = ""                         # full document with changes marked up
     lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
@@ -396,15 +401,17 @@ def _rewritable(paras: list[str]) -> list[bool]:
     return flags
 
 
-def check_rewrite(orig: dict, raw: str) -> dict:
-    """Validate a paragraph-rewrite response; returns {id: new_text} or raises InvalidEdits."""
+def check_rewrite(orig: dict, raw: str) -> tuple[dict, dict]:
+    """Validate a paragraph-rewrite response. Returns (accepted {id: text}, rejected {id: reason}).
+
+    A malformed response as a whole raises InvalidEdits; individual bad paragraphs are rejected one by one."""
     try:
         data = json.loads(raw)
     except (json.JSONDecodeError, TypeError) as e:
         raise InvalidEdits(f"Response was not valid JSON ({e}). Reply with only a JSON object.")
     if not isinstance(data, dict) or not isinstance(data.get("paragraphs"), list):
         raise InvalidEdits('Response must be {"paragraphs": [{"id": 1, "text": "..."}]}.')
-    out = {}
+    accepted, rejected = {}, {}
     for item in data["paragraphs"]:
         if (not isinstance(item, dict) or isinstance(item.get("id"), bool) or not isinstance(item.get("id"), int)
                 or not isinstance(item.get("text"), str)):
@@ -412,31 +419,46 @@ def check_rewrite(orig: dict, raw: str) -> dict:
         i, text = item["id"], item["text"].strip()
         if i not in orig:
             raise InvalidEdits(f"id {i} is not one of the paragraphs given ({min(orig)}-{max(orig)}).")
-        if i in out:
+        if i in accepted or i in rejected:
             raise InvalidEdits(f"id {i} appears twice.")
         old = orig[i].strip()
-        if not text or "\n\n" in text and "\n\n" not in old:
-            raise InvalidEdits(f"[{i}] must be a single non-empty paragraph.")
-        if not (0.4 * len(old) <= len(text) <= 3 * len(old) + 40):
-            raise InvalidEdits(f"[{i}] changed length implausibly; rewrite it, do not drop or pad content.")
-        lm_old, lm_new = _LEAD.match(old), _LEAD.match(text)
-        if (lm_old.group(0).strip() if lm_old else "") != (lm_new.group(0).strip() if lm_new else ""):
-            raise InvalidEdits(f"[{i}] must keep its list/quote marker exactly.")
-        missing = [t for t in dict.fromkeys(_PROTECT.findall(old)) if t not in text]
-        if missing:
-            raise InvalidEdits(f"[{i}] lost protected text that must stay verbatim: {missing[:5]}.")
-        out[i] = text
-    return out
+        nl2 = chr(10) * 2
+        why = None
+        if not text or (nl2 in text and nl2 not in old):
+            why = "must be a single non-empty paragraph"
+        elif not (0.4 * len(old) <= len(text) <= 3 * len(old) + 40):
+            why = "changed length implausibly; rewrite it, do not drop or pad content"
+        else:
+            lm_old, lm_new = _LEAD.match(old), _LEAD.match(text)
+            if (lm_old.group(0).strip() if lm_old else "") != (lm_new.group(0).strip() if lm_new else ""):
+                why = "must keep its list/quote marker exactly"
+            elif any(l.lstrip().startswith(("#", "```")) for l in text.split(chr(10))) and not any(
+                    l.lstrip().startswith(("#", "```")) for l in old.split(chr(10))):
+                why = "must not introduce headings or code fences"
+            else:
+                missing = [t for t in dict.fromkeys(_PROTECT.findall(old)) if t not in text]
+                if missing:
+                    why = f"lost protected text that must stay verbatim: {missing[:5]}"
+        if why:
+            rejected[i] = why
+        else:
+            accepted[i] = text
+    return accepted, rejected
 
 
 def rewrite_window(client, items: list, pairs: list, key: int, stats: Stats) -> dict:
-    """items: [(id, paragraph)]. Returns {id: new_text} for paragraphs that changed."""
+    """items: [(id, paragraph)]. Returns {id: new_text} for paragraphs that changed.
+
+    Paragraphs that still fail validation after the retries are left unchanged (never half-edited)
+    and counted in stats.rewrite_left_unchanged, which update_document reports as skipped."""
     nl = chr(10)
     numbered = nl.join(f"{n}. {t}" for n, t in pairs)
     body = (nl * 2).join(f"[{i}] {p.strip()}" for i, p in items)
     messages = [{"role": "system", "content": SYSTEM_REWRITE},
                 {"role": "user", "content": f"Requested changes:{nl}{numbered}{nl}{nl}{body}"}]
     orig = dict(items)
+    good: dict = {}
+    pending = set(orig)
     last = ""
     for attempt in range(1, MAX_ATTEMPTS + 1):
         raw, usage = client.complete(messages)
@@ -445,21 +467,43 @@ def rewrite_window(client, items: list, pairs: list, key: int, stats: Stats) -> 
             stats.prompt_tokens += usage.get("prompt_tokens", 0)
             stats.completion_tokens += usage.get("completion_tokens", 0)
         try:
-            new = check_rewrite(orig, raw)
-            new = {i: t for i, t in new.items() if t != orig[i].strip()}
-            with stats.lock:
-                stats.changes[key] = [{"before": orig[i].strip(), "after": t} for i, t in new.items()]
-            return new
+            accepted, rejected = check_rewrite({i: orig[i] for i in pending}, raw)
         except InvalidEdits as e:
             last = str(e)
-            with stats.lock:
-                stats.retries += 1
-                stats.log.append(f"rewrite window {key} attempt {attempt}: {last[:200]}")
+            rejected = None
+        if rejected is not None:
+            good.update(accepted)
+            pending = set(rejected)      # omitted paragraphs count as "unchanged"; only rejected ones are re-asked
+            if not rejected:
+                break
+            last = "; ".join(f"[{i}] {why}" for i, why in sorted(rejected.items()))
+            if attempt == MAX_ATTEMPTS:
+                break
+            reask = {i: orig[i] for i in sorted(pending)}
+            messages = [{"role": "system", "content": SYSTEM_REWRITE},
+                        {"role": "user", "content": f"Requested changes:{nl}{numbered}{nl}{nl}"
+                         + (nl * 2).join(f"[{i}] {p.strip()}" for i, p in reask.items())},
+                        {"role": "assistant", "content": raw[:2000]},
+                        {"role": "user", "content": f"Some paragraphs were rejected: {last}{nl}"
+                                                    "Return corrected JSON for ONLY those paragraphs "
+                                                    "(or omit a paragraph to leave it unchanged)."}]
+        else:
+            if attempt == MAX_ATTEMPTS:
+                raise UpdateFailed(f"rewrite window {key} failed after {MAX_ATTEMPTS} attempts; last error: {last}")
             messages = messages + [
                 {"role": "assistant", "content": raw[:2000]},
                 {"role": "user", "content": f"Your response was rejected: {last}{nl}"
                                             "Return a corrected JSON object for the same task."}]
-    raise UpdateFailed(f"rewrite window {key} failed after {MAX_ATTEMPTS} attempts; last error: {last}")
+        with stats.lock:
+            stats.retries += 1
+            stats.log.append(f"rewrite window {key} attempt {attempt}: {last[:200]}")
+    left = sorted(pending - set(good))
+    new = {i: t for i, t in good.items() if t != orig[i].strip()}
+    with stats.lock:
+        stats.changes[key] = [{"before": orig[i].strip(), "after": t} for i, t in new.items()]
+        if left:
+            stats.rewrite_left_unchanged += len(left)
+    return new
 
 
 def rewrite_document(text: str, pairs: list, client, stats: Stats, workers: int) -> str:
@@ -541,6 +585,54 @@ def run_targeted(text: str, pairs: list, client, stats: Stats, unit_words: int, 
     return new, marked
 
 
+from decimal import Decimal, ROUND_HALF_UP
+
+_PCT = re.compile(r"^\s*(raise|increase|lower|decrease|reduce|cut)\b.*?\bprices?\b.*?\bby\s+(\d+(?:\.\d+)?)\s*(?:%|percent)",
+                  re.I | re.S)
+_MONEY = re.compile(r"\$(\d[\d,]*(?:\.\d+)?)(\s+per\s+(month|year))", re.I)
+
+
+def percent_price_change(source: str, instruction: str):
+    """Deterministic path for "Raise/lower <scope> prices by N%": exact arithmetic, no LLM.
+
+    Only prices written like "$40 per month" / "$400 per year" are touched. Scope words narrow it:
+    monthly or annual (the clause before any ';' or 'leave'), and tier names that appear in the
+    document as "**Name**:". Returns None when it does not apply (then the LLM path is used),
+    else (new_source, [{before, after}])."""
+    m = _PCT.match(instruction)
+    if not m:
+        return None
+    clause = re.split(r";|\bleave\b|\bexcept\b", instruction, maxsplit=1, flags=re.I)[0].lower()
+    month = "month" in clause
+    year = "annual" in clause or "year" in clause
+    periods = {"month"} if month and not year else {"year"} if year and not month else {"month", "year"}
+    names = {t.strip() for t in re.findall(r"\*\*([^*\n]{2,30})\*\*\s*:", source)}
+    named = [t for t in names if re.search(r"\b" + re.escape(t.lower()) + r"\b", clause)]
+    factor = Decimal(1) + (Decimal(m.group(2)) / 100) * (1 if m.group(1).lower() in ("raise", "increase") else -1)
+    changes = []
+
+    def bump(mm):
+        old, period = mm.group(1), mm.group(3).lower()
+        if period not in periods:
+            return mm.group(0)
+        val = Decimal(old.replace(",", "")) * factor
+        val = val.quantize(Decimal("1") if val == val.to_integral_value() else Decimal("0.01"), ROUND_HALF_UP)
+        txt = f"{val:,}" if "," in old else f"{val}"
+        new = f"${txt}{mm.group(2)}"
+        changes.append({"before": mm.group(0), "after": new})
+        return new
+
+    out = []
+    for line in source.split(chr(10)):
+        if named and not any(f"**{t}**" in line for t in named):
+            out.append(line)
+        else:
+            out.append(_MONEY.sub(bump, line))
+    if not changes:
+        return None
+    return chr(10).join(out), changes
+
+
 def update_document(source: str, changes: list[str], client, unit_words: int = selector.UNIT_WORDS,
                     window_words: int = selector.WINDOW_WORDS, workers: int = WORKERS,
                     retrieval: bool = True) -> tuple[str, Stats]:
@@ -575,6 +667,18 @@ def update_document(source: str, changes: list[str], client, unit_words: int = s
             renames.append({"before": m.group("a").strip(), "after": m.group("b").strip(), "occurrences": n})
     if renames:
         stats.changes[-1] = renames
+    prices = []
+    for i, c in enumerate(changes):
+        if i in handled:
+            continue
+        r = percent_price_change(source, c)
+        if r is not None:
+            source, ch = r
+            handled.add(i)
+            stats.applied_by[i + 1] = len(ch)
+            prices += ch
+    if prices:
+        stats.changes[-2] = prices
     targeted, wide = [], []
     for i, c in enumerate(changes):
         if i in handled:
@@ -584,7 +688,7 @@ def update_document(source: str, changes: list[str], client, unit_words: int = s
             stats.skipped.append({"instruction": i + 1, "text": c, "reason": reason})
         else:
             (wide if selector.GLOBAL_RE.search(c) else targeted).append((i + 1, c))
-    if not targeted and not wide and not renames:
+    if not targeted and not wide and not renames and not prices:
         raise UpdateFailed("no instruction could be applied: " + "; ".join(
             f"#{k['instruction']} {k['reason']}" for k in stats.skipped))
 
@@ -596,6 +700,10 @@ def update_document(source: str, changes: list[str], client, unit_words: int = s
         stats.mode = (stats.mode + "+" if stats.mode else "") + "rewrite"
         before = text
         text = rewrite_document(text, wide, client, stats, workers)
+        if stats.rewrite_left_unchanged:
+            stats.skipped.append({"instruction": wide[0][0], "text": wide[0][1],
+                                  "reason": f"{stats.rewrite_left_unchanged} paragraph(s) left unchanged: "
+                                            "the rewrite failed validation after retries"})
         if text != before:
             for n, _ in wide:
                 stats.applied_by[n] = 1

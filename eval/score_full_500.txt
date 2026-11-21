@@ -1,0 +1,12 @@
+cases=500  pass=497  clean_fail(accepted)=3  FAIL=0
+per change type (cases containing it):
+  ambiguous_target       pass=215 clean_fail=  3 fail=  0
+  change_rate_limit      pass=240 clean_fail=  0 fail=  0
+  formal_tone            pass=122 clean_fail=  0 fail=  0
+  missing_target         pass=214 clean_fail=  3 fail=  0
+  raise_all_prices       pass=103 clean_fail=  0 fail=  0
+  raise_annual_only      pass= 90 clean_fail=  0 fail=  0
+  raise_monthly_only     pass= 79 clean_fail=  0 fail=  0
+  raise_pro_annual       pass= 98 clean_fail=  0 fail=  0
+  remove_legacy_api      pass=232 clean_fail=  0 fail=  0
+  rename_product         pass=229 clean_fail=  0 fail=  0
