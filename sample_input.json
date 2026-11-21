@@ -1,0 +1,7 @@
+{
+  "sourceDocument": "# Product Guide\n\n## Pricing\n\nBasic costs $10 per month. Pro costs $20 per month. Enterprise costs $100 per month.\n\n## Legacy API\n\nThe legacy API (v1) is deprecated and will be removed next year.\n\n## Support\n\nContact us anytime, we're happy to help you out!\n",
+  "changes": [
+    "Update the pricing section to reflect a 10% increase across all tiers.",
+    "Remove the paragraph about the legacy API."
+  ]
+}
