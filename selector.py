@@ -15,7 +15,7 @@ from collections import Counter
 
 UNIT_WORDS = 250        # retrieval granularity (~330 tokens)
 WINDOW_WORDS = 1500     # max words per model call after merging adjacent selected units
-REL_THRESHOLD = 0.25    # keep units scoring >= 25% of the best unit (recall-biased)
+REL_THRESHOLD = 0.40    # keep units scoring >= 40% of the best unit
 SECTION_CAP_WORDS = 1200
 
 GLOBAL_RE = re.compile(
@@ -34,8 +34,9 @@ please ensure also more less""".split())
 def stem(w: str) -> str:
     for suf in ("ing", "edly", "ed", "es", "s"):
         if w.endswith(suf) and len(w) - len(suf) >= 3:
-            return w[: -len(suf)]
-    return w
+            w = w[: -len(suf)]
+            break
+    return w[:-1] if w.endswith("e") and len(w) > 3 else w   # price/pricing/prices -> pric
 
 
 def tokenize(text: str) -> list[str]:

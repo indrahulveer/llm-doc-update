@@ -1,6 +1,6 @@
 # LLM-Driven Document Updates
 
-CLI that applies natural-language edit instructions to a document using the OpenAI API. Python 3.10+, standard library only (no installs).
+CLI that applies natural-language edit instructions to a document using the OpenAI API. Python 3.10+, standard library only (no installs). See `WHAT_WAS_DONE.md` for a plain summary of the work and the bugs found and fixed along the way.
 
 ## 1. Setup and commands
 
@@ -8,179 +8,126 @@ CLI that applies natural-language edit instructions to a document using the Open
 $env:OPENAI_API_KEY = "<your key>"        # bash: export OPENAI_API_KEY=...
 # optional: $env:OPENAI_MODEL = "gpt-4o-mini" (default)
 
-python docupdate.py sample_input.json                 # result JSON on stdout
-python docupdate.py sample_input.json -o result.json  # or to a file (atomic write)
-python docupdate.py sample_input.json --no-retrieval  # force a full-document scan
-python docupdate.py sample_input.json --highlight review.md   # also write a Markdown review copy of the changes
+# one document
+python docupdate.py sample_input.json                      # JSON result on stdout
+python docupdate.py sample_input.json --format text        # only the updated document on stdout
+python docupdate.py sample_input.json --highlight review.md  # also write a ~~old~~ **new** review copy
+python docupdate.py sample_input.json --strict             # exit 1 if any instruction was skipped
+python docupdate.py sample_input.json --no-retrieval       # send the whole document (baseline)
 
-python -m unittest discover -s tests -v               # tests; no API key needed
+# many documents, unattended (continues after failures, prints a final report, runs score.py if present)
+python batch.py <dataset_or_inputs_dir> --out results --jobs 4 [--limit N] [--resume]
+
+# tests (no API key needed)
+python -m unittest discover -s tests -v
 ```
 
-The key is read only from `OPENAI_API_KEY`. It is never written to output or logs, and no HTTP error bodies are logged.
+The key is read only from `OPENAI_API_KEY`. It is never written to output or logs, and API error bodies are not logged.
 
 ## 2. Input, output, failure
 
-Input:
-```json
-{"sourceDocument": "full text...", "changes": ["Make the tone more formal."]}
-```
+Input: `{"sourceDocument": "full text...", "changes": ["Make the tone more formal."]}`
 
-Success (exit code 0):
+Success (exit code 0), `--format json` (default):
 ```json
-{"status": "ok", "updatedDocument": "...", "stats": {"mode": "targeted", "wordsTotal": 9931, "wordsSent": 558, "windows": 1, "modelCalls": 1, "retries": 0,
-  "editsApplied": 12, "promptTokens": 0, "completionTokens": 0},
+{"status": "ok", "updatedDocument": "...",
+ "skipped": [{"instruction": 2, "text": "...", "reason": "target 'Data Residency' not found in the document"}],
+ "stats": {"mode": "targeted+rewrite", "wordsTotal": 5039, "wordsSent": 2100, "windows": 9, "modelCalls": 9,
+           "retries": 0, "editsApplied": 31, "promptTokens": 0, "completionTokens": 0},
  "changes": [{"before": "Basic costs $10", "after": "Basic costs $11"}]}
 ```
+`--format text` prints only the document (skips are listed on stderr), which suits shell pipelines and the dataset's `run_batch.py`.
 
-Failure (exit code 1). There is **no** `updatedDocument` field, and nothing partial is written:
+Failure (exit code 1). There is **no** document in the output, and nothing partial is written:
 ```json
-{"status": "error", "error": "chunk 3 failed after 3 attempts; last error: edits[0].find does not occur verbatim ..."}
+{"status": "error", "error": "rewrite window 1000002 failed after 3 attempts; last error: [4] lost protected text ..."}
 ```
-Failure cases: a missing key, a bad input, persistent API errors, a chunk still invalid after retries, or a model that produced no effective change at all. A no-op is treated as failure because it's usually a silent miss. A batch runner can key on the exit code and `status`.
+Failure cases: missing key, bad input, persistent API errors, a window still invalid after retries, no effective change at all, no instruction resolvable, or (with `--strict`) any skipped instruction.
 
-## Techniques used (summary)
-
-| Stage | Technique | Kind | LLM tokens? |
-|---|---|---|---|
-| Segmentation | Paragraph-aligned units (about 250 words) | rule-based NLP | none |
-| Normalisation | Lowercasing, tokenisation, stop-word and editing-verb removal, light suffix stemming | classical NLP | none |
-| Relevance | **BM25** ranking of units against each instruction (query-focused filtering) | information retrieval | none |
-| Context | Neighbour units, and whole-section expansion from matched markdown headings | document-structure heuristics | small |
-| Routing | Regex markers for document-wide instructions (tone, style, "throughout", ...), and zero-hit fallback to a full scan | rule-based | none |
-| Editing | LLM proposes `{find, replace}` edits (structured JSON output, temperature 0) | LLM | only relevant windows |
-| Verification | Schema check, verbatim-and-unique anchor match, overlap check, size sanity check | programmatic validation | none |
-| Recovery | Error-feedback retry (max 3 per window) and backoff for 429/5xx/network | bounded retry | only the failed window |
-| Review | Change highlighting (see below) | diff-style markup | none |
-
-## Highlighting changes
-
-Every run reports exactly what changed. This comes from the validated edits themselves, not from diffing afterwards.
-- The JSON output has a `changes` list of `{before, after}` pairs (no-op edits are dropped).
-- `--highlight review.md` writes the full document with each change marked as `~~removed~~` and `**added**`. Each line is marked separately, so multi-paragraph deletions render correctly in Markdown.
-
-Output for `sample_input.json`:
-
-```markdown
-## Pricing
-
-~~Basic costs $10~~**Basic costs $11** per month. ~~Pro costs $20~~**Pro costs $22** per month. ~~Enterprise costs $100~~**Enterprise costs $110** per month.
-
-~~## Legacy API~~
-
-~~The legacy API (v1) is deprecated and will be removed next year.~~
-```
-
-This lets a human verify the change in seconds, which is also the best defence against the semantically wrong responses described in section 5.
-
-## Requirements compliance
-
-Status key: **Met** means implemented and covered by offline tests with a stubbed model. **Not live-verified** means the real OpenAI call path has never been run (no API key was available while building).
-
-### Functional requirements
-| ID | Requirement | Status | Where / evidence |
-|---|---|---|---|
-| FR-1 | Accept `sourceDocument` string and `changes` array | **Met** | Input is validated in `update_document` and the CLI; bad input gives a clean error |
-| FR-2 | Use an LLM to interpret instructions and produce edits | **Met in code, not live-verified** | `OpenAIClient` and the edit-proposal prompt in `docupdate.py` |
-| FR-3 | Targeted and document-wide changes | **Met (offline)** | `selector.py` routes targeted instructions to BM25-selected windows and document-wide ones to every window; tests `RetrievalTests` |
-| FR-4 | Return the complete updated document | **Met** | Unselected text is passed through byte-for-byte; test asserts the output equals the source with only the intended replacement |
-| FR-5 | Validate model output | **Met** | Schema, verbatim-and-unique `find`, overlap, size sanity, and no-op checks (`parse_edits`, `apply_edits`) |
-| FR-6 | Recover from bad responses; report failure explicitly | **Met per document** | Up to 3 attempts per window with error feedback, plus backoff for API errors; on exhaustion the CLI prints `{"status":"error"}`, exits 1 and returns no document. A batch runner loops over the CLI (see gaps) |
-
-### Non-functional requirements
-| Area | Status | How it is addressed, and what is unproven |
-|---|---|---|
-| Accuracy | **Preservation met; edit correctness not live-verified** | Preservation is verified by test. Whether the model's edits are right needs a live run. Retrieval can silently miss passages (see gaps) |
-| Reliability | **Met by design; not measured** | Detectable errors are caught and retried, and failures are never returned as success. There is no measured comparison against a direct model call |
-| Scalability (about 10k words, unattended) | **Met by design (offline)** | About 7 windows for 10k words, run 4 in parallel; tested up to about 40k words with a stubbed model. One document per CLI invocation |
-| Latency | **By design; not timed live** | Targeted edit: one or two calls, independent of document size. Global edit: about N/1500 calls, 4-way parallel |
-| Token efficiency | **Measured in words sent; not in live tokens** | Targeted edit: constant (about 560 words sent for any size). Global edit: linear in N. See the scaling table in section 3 |
-
-### Submission constraints
-| Constraint | Status |
-|---|---|
-| Script or CLI | Met: `python docupdate.py input.json` |
-| README names a real alternative and why it was rejected | Met: section 3 (full-document rewrite). No switch of approach; retrieval was added to the chosen one |
-| Known failure example that passes all checks | Met: section 5, verified by `test_readme_semantic_failure_example` |
-| 1-2 hour scope, at most 100 MB | Met: a few small source files |
-
-### Known gaps
-1. **No live run:** the OpenAI client, real token counts and real latency are unmeasured.
-2. **No batch runner:** one document per invocation. Unattended runs need a loop over the CLI keyed on the exit code and `status`.
-3. **Silent retrieval misses:** a passage that needs editing but shares no vocabulary with the instruction is skipped without an error. `--no-retrieval` is the safe fallback.
-4. **Partial no-ops:** the no-op check only fires when the whole document is unchanged. If one of several instructions is silently ignored, the run still reports success.
+**Skipped instructions.** If an instruction's target is missing or ambiguous it is **not applied**, and it is listed under `skipped` with a reason. The rest of the instructions are applied. This is an explicit, reported decision, not a silent one. `--strict` turns any skip into a failure.
 
 ## 3. Architecture
 
-**Alternative A: full-document rewrite.** Simple, and it is naturally good at global rewrites. But for a 10k-word document, output is about 13k tokens, which takes minutes. Long outputs get truncated or silently drift, and there is no cheap way to prove unrelated text was preserved (you'd have to diff and guess intent). A single failure costs the whole call.
+**Alternative A: full-document rewrite.** Simple, and it is naturally good at global rewrites. But for a 10k-word document the output is about 13k tokens (minutes of latency), long outputs get truncated or silently drift, and there is no cheap way to prove unrelated text was preserved. One failure costs the whole call. Rejected.
 
-**Chosen: B (validated edit proposals) plus classical-NLP retrieval in front of the LLM.**
+**Chosen: staged pipeline. Cheap deterministic NLP first, the LLM only where it is needed, and programmatic validation of everything the LLM returns.**
 
-Pipeline:
-1. **Split** into paragraph-aligned units of about 250 words (`''.join(units) == source` is asserted).
-2. **Select (no LLM, stdlib only, `selector.py`).** This is query-focused filtering:
-   - Each instruction is tokenised (stop-words and generic editing verbs like "update" or "remove" dropped, light stemming) and scored against every unit with **BM25**.
-   - Units scoring at least 25% of the best unit are kept. The threshold is recall-biased.
-   - Neighbouring units are added as context. If a markdown heading matches, the rest of its section is added (up to about 1,200 words).
-   - **Document-wide** instructions (tone, style, "throughout", spelling, and similar markers) select every unit.
-   - An instruction with **no lexical hit** also selects every unit. We never guess "nothing relevant"; we fall back to a full scan.
-3. **Merge** adjacent selected units into windows of up to 1,500 words. Each window is sent with **only the instructions that selected it**.
-4. **Propose:** the model returns `{"edits": [{"find", "replace"}]}` for its window.
-5. **Validate and apply:** `find` must occur verbatim exactly once, edits must not overlap, and the schema must match. A violation sends the specific error back to the model (max 3 attempts per window, plus bounded backoff for 429/5xx/network errors).
-6. Unselected text is passed through byte-for-byte. If **any** window fails, the job fails. Nothing is assembled until all windows succeed.
-
-I did not switch approaches during implementation. I added the retrieval stage after re-reading the requirement to scale token usage with *relevant* content rather than document size.
-
-`--no-retrieval` forces the full scan, which is useful as an accuracy baseline.
-
-### Which NLP methods from the list I used
-| Method | Used? | Why |
+| Stage | What it does | LLM? |
 |---|---|---|
-| Normalisation, tokenisation, stop-word removal, light stemming | yes, **for retrieval only** | The text sent to the LLM is the original, unmodified |
-| Paragraph segmentation | yes | Keeps units self-contained so `find` anchors stay valid |
-| BM25 query-focused filtering | yes | The core token saver for targeted edits |
-| Section-aware expansion (heading structure) | yes | "Pricing section" must include the tiers beneath the heading |
-| Keyword fallback to full scan | yes | Protects recall |
-| Embeddings, cross-encoder rerank | no | Needs model downloads or an extra API. BM25 is enough for edit instructions, which reuse the document's own wording |
-| Extractive/abstractive summarisation, prompt compression (LLMLingua) | **no, on purpose** | Compressing the text would corrupt the exact text the model must copy into `find` and the output we return |
-| NER, coreference, topic models, zero-shot classification | no | No measurable benefit for this task, and heavy dependencies |
+| 0. Literal rename | "Rename X to Y everywhere" is a literal substitution, done in code. It also renames derived forms (joined/hyphenated lowercase, as in URLs and code) | no |
+| 1. Grounding pre-flight | Quoted targets must exist, and for replace-style instructions must be unambiguous (`'contact support'` occurring twice is skipped). Capitalised names on the target side of an edit verb must exist in the document ("Change the Platinum tier..." is skipped). For update/change/set, the content words of the target must exist ("support phone number" with no phone in the document is skipped) | no |
+| 2. Targeted edits | BM25 query-focused filtering over paragraph units (about 250 words) selects the relevant windows, with neighbour and whole-section expansion and a full-scan fallback when nothing matches. The model returns `{change, find, replace, all}` edits, which are validated and applied | yes, relevant windows only |
+| 3. Document-wide edits | Instructions about tone, style or "throughout" rewrite prose paragraphs, addressed **by paragraph id** (no verbatim anchors that can be mis-copied). Headings and code blocks are never offered | yes, all prose |
 
-### Targeted vs document-wide requests
-- **Targeted** ("remove the legacy API paragraph", "+10% pricing"): only about 2-3 units are sent, usually one call. The rest of the document is untouched and byte-identical.
-- **Document-wide** ("more formal"): all windows are sent, in parallel (4 workers). Each response is bounded by the window size.
-- **Mixed requests:** each window receives only the instructions that selected it.
-- **Accuracy trade-offs:**
-  - The retrieval stage can **miss** a passage that needs editing but doesn't share vocabulary with the instruction (for example, "rename our flagship product" when the product is never named in the instruction). That is a silent miss. The mitigations are the recall-biased threshold, neighbour and section expansion, and the zero-hit fallback. A window can't see other windows, so cross-reference instructions ("make section 5 consistent with section 2") are weaker than a full rewrite.
-  - Words in the instruction that also appear in unrelated paragraphs (a number like "11") can pull in extra units. That costs tokens, not correctness.
+**Why stage 3 exists (a switch during implementation).** The first version used verbatim find/replace for tone rewrites as well. On the real dataset, tone cases failed repeatedly: with dozens of edits per window the model mis-copied anchors or produced non-unique ones, and three attempts were not enough. That triggered the switch to paragraph-id rewriting for document-wide instructions, with a programmatic check that numbers, prices, URLs, `inline code`, **bold** terms and list markers survive. Rename was moved out of the LLM entirely for the same reason (dozens of identical occurrences cannot be anchored uniquely).
 
-### Measured scaling (offline, synthetic doc; `words_sent` is what goes to the model)
-| Document words | Targeted: words sent / windows | Global: words sent / windows |
-|---|---|---|
-| ~1.7k | 282 / 1 | 1,741 / 2 |
-| ~9.9k | 558 / 1 | 9,931 / 7 |
-| ~40k | 558 / 1 | 39,961 / 28 |
+### Validation (all programmatic)
+- **Edits:** JSON schema, `change` is a valid instruction number, `find` occurs verbatim and exactly once (unless `all` is set), no overlapping edits, replacement size sanity, and a **relevance check on large deletions** (a deletion must share a content word with the instruction it claims to serve). That check came from a real failure where the model deleted an unrelated block.
+- **Rewrites:** ids valid and unique, a single non-empty paragraph, length ratio sane, list/quote marker unchanged, **protected text unchanged**.
+- **Job level:** every instruction is attributed to edits. An instruction that changed nothing is reported in `skipped`. A job that changes nothing at all fails.
+- **Deletions** collapse the blank-line run they would leave behind.
 
-Input tokens, output tokens and latency by request type (N = document words):
-- **Targeted:** input is about 1.3 × (relevant region), which is **constant in N**. Output is the size of the edits. Latency is one or two calls. The only O(N) cost is the local BM25 pass (milliseconds, no tokens).
-- **Global:** input is about 1.3N plus a small per-window instruction overhead. Output is up to about 1.3N. Calls ≈ N/1500, run 4-way parallel, so latency ≈ ceil(N/1500/4) × per-call latency, and each call is bounded.
-- **Full rewrite (A):** input about 1.3N and output about 1.3N for every request type, with a single long serial call.
+### Recovery
+Up to 3 attempts per window, feeding the specific error back to the model, plus backoff for 429/5xx/network errors (honouring `Retry-After`). Any window that is still bad fails the whole document. No partial document is returned. `batch.py` records the failure and moves on to the next document.
+
+### Cost scaling (N = document words)
+- **Targeted:** about 2-3 units (around 560 words) per matched region. This is constant in N for a fixed number of matches, usually one call.
+- **Document-wide:** linear in N. Input about 1.3N tokens, output up to about 1.3N, in windows of about 350 words, 4 in parallel.
+- **Rename:** zero tokens.
+- **Full rewrite (A):** about 1.3N in and 1.3N out for every request, in one serial call.
 - Retries only re-cost the one failed window.
 
-## 4. Verification actually run
+### Which NLP methods are used, and which are not
+| Method | Used? | Notes |
+|---|---|---|
+| Normalisation, tokenisation, stop-word removal, light stemming | yes, **for retrieval and grounding only** | The text sent to the LLM is never altered |
+| Paragraph segmentation, markdown-heading structure | yes | Units, sections and rewrite windows |
+| BM25 query-focused filtering | yes | The core token saver for targeted edits |
+| Rule-based instruction parsing (regex): rename, quoted anchors, capitalised entities, global-intent markers | yes | Routing and grounding |
+| Embeddings, rerankers, NER models, coreference, topic models, zero-shot classification | no | Extra dependencies for no clear gain on this task |
+| Summarisation and prompt compression | **no, on purpose** | They would corrupt the text that must be copied or returned |
 
-| Check | Status |
+## 4. Requirements compliance
+
+Status: **Met** = implemented and covered by offline tests; **Live** = also exercised against the real OpenAI API on the dataset (section 5).
+
+| ID | Requirement | Status |
+|---|---|---|
+| FR-1 | Accept `sourceDocument` and `changes` | Met, Live |
+| FR-2 | LLM interprets instructions and produces edits | Met, Live |
+| FR-3 | Targeted and document-wide changes | Met, Live (price, rate-limit, removal, rename, tone cases) |
+| FR-4 | Return the complete updated document | Met, Live |
+| FR-5 | Validate model output | Met, Live (see Validation) |
+| FR-6 | Recover, or fail explicitly so the batch continues | Met, Live. `batch.py` continues after failures. Exit code 1 with no document on failure |
+| Accuracy | Apply intended changes, preserve the rest | 55/55 on the dataset subset run (section 5) |
+| Reliability | Catch detectable errors, never accept silently | Met. Concrete catches found during live runs are listed in `WHAT_WAS_DONE.md` |
+| Scalability | About 10k words, unattended, many documents | Met by `batch.py`. Documents up to 9.6k words are in the dataset, but only the first 55 documents were run |
+| Latency | Reasonable as documents grow | Measured in section 5 |
+| Token efficiency | Scales with relevant content | Measured in section 5 |
+
+## 5. Evaluation on the 500-case dataset
+
+The dataset is `doc-edit-dataset-500` (zip included in the submission). Run with `python batch.py <dataset> --out results --jobs 4 --resume`, model `gpt-4o-mini`.
+
+**The full 500-case run was started and then stopped by request after 55 documents had completed. The numbers below cover those 55 documents only. They are not a 500-case result.**
+
+| Metric | Result (first 55 documents) |
 |---|---|
-| Unit tests (`python -m unittest discover -s tests -v`): 16 pass | **ran** |
-| Targeted edit, unrelated text preserved | **ran** (stubbed model) |
-| Malformed JSON, then not-found `find`, then success | **ran** (stubbed model) |
-| Failure after retries exhausted (exactly 3 calls, bounded), one bad chunk fails the job, no-op fails | **ran** (stubbed model) |
-| CLI exit code 1 and no document on failure (no key set) | **ran** |
-| Retrieval: targeted edit sends under 15% of a 5k-word doc, `words_sent` is constant as the doc grows 4x, global instruction sends every window, zero-hit falls back to full scan, heading pulls in its section | **ran** (stubbed model) |
-| Highlight/changes output: markup is correct, and stripping it reproduces the updated document | **ran** (stubbed model) |
-| Live OpenAI smoke test | **not run**: no `OPENAI_API_KEY` was configured in this environment |
+| Documents succeeded / failed | 55 / 0 |
+| Dataset scorer (`score.py`) | **55 pass, 0 clean_fail, 0 FAIL** |
+| Prompt / completion tokens | 124,393 / 48,033 (about 2.3k / 0.9k per document) |
+| Text sent to the model | 62,145 of 160,535 words (39%) |
+| Latency per document | mean 6.1s, p50 3.2s, p95 23.4s, max 38.0s (4 documents in parallel) |
+| Documents where some instruction was skipped and reported | 43 (the dataset deliberately includes missing and ambiguous targets) |
 
-The live path (`OpenAIClient`) is therefore untested against the real API. Run `python docupdate.py sample_input.json` with a key to check it.
+Per change type, all passing: ambiguous_target 28, change_rate_limit 21, formal_tone 14, missing_target 25, raise_all_prices 10, raise_annual_only 11, raise_monthly_only 9, raise_pro_annual 12, remove_legacy_api 30, rename_product 28 (cases containing each type). The raw per-document records are in `eval/records.jsonl` and the scorer output in `eval/partial_score.txt`.
 
-## 5. A semantically wrong response that passes every check
+Caveats:
+- The scorer checks tone cases only for surviving protected strings and headings. I read one rewritten document by eye (case_001): the prose became more formal, the rename was applied, and the code block was untouched. I did not read the others.
+- Earlier iterations of the code scored worse (for example 6/12 and 9/12 before the fixes in section 3). The final numbers come from the final code, but the fixes were developed against these same first cases, so they are not a blind test.
+- Documents 56-500 were not run.
+
+## 6. A semantically wrong response that passes every check
 
 - **Source:** `Basic costs $10 per month. Pro costs $20 per month.`
 - **Requested change:** `Increase all prices by 10%.`
@@ -192,12 +139,24 @@ The live path (`OpenAIClient`) is therefore untested against the real API. Run `
 - **Expected result:** `Basic costs $11 per month. Pro costs $22 per month.`
 - **Actual result:** `Basic costs $11 per month. Pro costs $24 per month.`
 
-This is verified by `test_readme_semantic_failure_example`, which feeds the response through the real `update_document` path (`parse_edits` → `apply_edits`) and asserts the wrong `$24` output is accepted.
+`test_readme_semantic_failure_example` feeds this response through the real `update_document` path and asserts that the wrong `$24` is accepted.
 
-**What the checks cannot establish:** the checks are all *structural*. They show the response is well-formed, that each anchor exists once, and that edits are disjoint, so the change is mechanically applicable and localized. They cannot show the edit is *correct*: that arithmetic is right, that the right passages were targeted, that all relevant passages were found (misses look the same as "nothing to change"), that tone or meaning was preserved, or that cross-chunk consistency holds. Closing that gap would need a second model pass or human review of the diff, domain-specific validators (e.g. recompute numbers), or sampling and agreement checks. None of these are implemented.
+**What the checks cannot establish:** they are structural. They show the response is well-formed, anchors exist, edits are disjoint, protected text survived, and a deletion shares words with its instruction. They cannot show an edit is *correct*: that arithmetic is right, that the right passages were targeted, that all relevant passages were found, or that tone or meaning is good. The `--highlight` review copy and the `changes` list exist so a human can verify quickly. A second model pass or recomputing numbers would close more of the gap, and neither is implemented.
+
+## 7. Known limitations
+1. **Silent retrieval misses.** A passage that needs a targeted edit but shares no vocabulary with the instruction is not sent to the model and is skipped without an error. `--no-retrieval` is the safe fallback.
+2. **Grounding heuristics can false-skip.** An instruction like "Change the Pro price to $25" is skipped if the document never uses the word "price" (it says "costs"). Skips are always reported, and `--strict` makes them failures, but a legitimate instruction can be skipped.
+3. **Skip-and-continue by default.** A document with a skipped instruction exits 0 with the rest applied. Use `--strict` if a partial result is unacceptable.
+4. **Tone quality is not verified**, only that facts, numbers, links, code, headings and list markers survive.
+5. **Instruction interplay.** Instructions are processed in stages (rename, targeted, document-wide), not strictly in the order given.
+6. **Rename highlighting.** Literal renames are reported in `changes` with an occurrence count, not marked up inline in the `--highlight` copy.
+7. **Cross-window references** ("make section 5 consistent with section 2") are weak, because a window cannot see the others.
 
 ## Files
+- `docupdate.py`: pipeline, validation, OpenAI client, CLI
 - `selector.py`: BM25 relevance selection and window planning (no LLM)
-- `docupdate.py`: chunking, validation, application, OpenAI client, CLI
+- `batch.py`: unattended multi-document runner with a final report and optional dataset scoring
+- `tests/test_docupdate.py`: 28 offline tests with a scripted model stub
 - `sample_input.json`: example input
-- `tests/test_docupdate.py`: offline tests with a scripted model stub
+- `eval/`: records and scorer output from the live dataset run
+- `WHAT_WAS_DONE.md`: summary of the work and of the bugs found and fixed

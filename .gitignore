@@ -3,3 +3,5 @@ __pycache__/
 result.json
 *.tmp
 .env
+results/
+results_full_run.log

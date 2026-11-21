@@ -153,12 +153,28 @@ class RetrievalTests(unittest.TestCase):
             sent.append(st.words_sent)
         self.assertEqual(sent[0], sent[1])
 
-    def test_global_instruction_sends_everything(self):
-        src = self.long_doc(10)
-        client = ScriptedClient(*[edits() for _ in range(50)])
-        with self.assertRaises(d.UpdateFailed):  # empty edits => no-op failure, but every window was sent
-            d.update_document(src, ["Make the tone throughout more formal."], client, workers=1)
-        self.assertEqual(client.calls, len(d.chunk_document(src, 1500)))
+    def test_global_instruction_rewrites_paragraphs_and_protects_facts(self):
+        nl2 = chr(10) * 2
+        src = "# Guide" + nl2 + "Basic costs $10 per month, see https://x.example.com/a for details." + nl2 + "Hey, ya gotta try it!"
+        good = json.dumps({"paragraphs": [
+            {"id": 2, "text": "Basic costs $10 per month; see https://x.example.com/a for details."},
+            {"id": 4, "text": "Please make sure to try it."}]})
+        # heading (id 0) is never offered; ids are the paragraph positions
+        client = ScriptedClient(good)
+        doc, st = d.update_document(src, ["Make the tone throughout more formal."], client, workers=1)
+        self.assertIn("Please make sure to try it.", doc)
+        self.assertTrue(doc.startswith("# Guide"))
+        self.assertEqual(client.calls, 1)
+
+    def test_rewrite_that_drops_a_price_or_url_is_rejected_then_recovers(self):
+        nl2 = chr(10) * 2
+        src = "# Guide" + nl2 + "Basic costs $10 per month, see https://x.example.com/a."
+        bad = json.dumps({"paragraphs": [{"id": 2, "text": "Basic is cheap, see the website."}]})
+        good = json.dumps({"paragraphs": [{"id": 2, "text": "Basic costs $10 per month; see https://x.example.com/a."}]})
+        client = ScriptedClient(bad, good)
+        doc, st = d.update_document(src, ["Make the tone more formal throughout."], client, workers=1)
+        self.assertEqual((client.calls, st.retries), (2, 1))
+        self.assertIn("; see", doc)
 
     def test_no_lexical_hit_falls_back_to_full_scan(self):
         import selector
@@ -171,6 +187,117 @@ class RetrievalTests(unittest.TestCase):
         wanted, _ = selector.select(units, ["Update the pricing section."])
         self.assertTrue(wanted[1] and wanted[2])
         self.assertFalse(wanted[4])
+
+
+NL2 = chr(10) * 2
+
+
+class GroundingTests(unittest.TestCase):
+    def test_all_true_replaces_every_occurrence_and_default_still_rejects_duplicates(self):
+        text = "Nimbus Desk is great. Use Nimbus Desk daily."
+        out = d.apply_edits(text, [d.Edit("Nimbus Desk", "Harbor Link", 1, True)])
+        self.assertEqual(out, "Harbor Link is great. Use Harbor Link daily.")
+        with self.assertRaises(d.InvalidEdits):
+            d.apply_edits(text, [d.Edit("Nimbus Desk", "Harbor Link", 1, False)])
+
+    def test_quoted_anchor_missing_or_ambiguous_is_skipped_without_a_model_call(self):
+        src = "Please contact support. Later, contact support again." + NL2 + "Section A text here."
+        self.assertIn("ambiguous", d.check_anchor(src, "Replace the phrase 'contact support' with 'open a ticket'."))
+        self.assertIn("not found", d.check_anchor(src, "Remove the section titled 'Data Residency'."))
+        self.assertIsNone(d.check_anchor(src, "Replace 'Section A' with 'Section B'."))
+        self.assertIsNone(d.check_anchor(src, "Replace every 'contact support' with 'open a ticket'."))
+        client = ScriptedClient()
+        with self.assertRaises(d.UpdateFailed):          # nothing resolvable -> clean failure, zero calls
+            d.update_document(src, ["Replace the phrase 'contact support' with 'x'."], client, workers=1)
+        self.assertEqual(client.calls, 0)
+
+    def test_skipped_instruction_is_reported_while_the_rest_is_applied(self):
+        src = "Pro costs $20 per month." + NL2 + "Contact support." + NL2 + "Contact support."
+        client = ScriptedClient(edits(("Pro costs $20", "Pro costs $22")).replace('{"find"', '{"change": 2, "find"'))
+        doc, st = d.update_document(
+            src, ["Replace the phrase 'Contact support' with 'Open a ticket'.", "Raise the Pro price by 10%."],
+            client, workers=1)
+        self.assertIn("$22", doc)
+        self.assertEqual([k["instruction"] for k in st.skipped], [1])
+
+    def test_instruction_with_no_attributed_edit_is_reported(self):
+        src = "Pro costs $20 per month. Basic costs $10 per month."
+        good = json.dumps({"edits": [{"change": 1, "find": "Pro costs $20", "replace": "Pro costs $22"}]})
+        doc, st = d.update_document(src, ["Raise Pro by 10%.", "Change the Platinum tier to $999."],
+                                    ScriptedClient(good), workers=1)
+        self.assertEqual([k["instruction"] for k in st.skipped], [2])
+
+    def test_invalid_change_number_is_rejected_and_retried(self):
+        bad = json.dumps({"edits": [{"change": 9, "find": "Pro costs $20", "replace": "x"}]})
+        good = json.dumps({"edits": [{"change": 1, "find": "Pro costs $20", "replace": "Pro costs $22"}]})
+        client = ScriptedClient(bad, good)
+        d.update_document("Pro costs $20 per month.", ["Raise Pro."], client, workers=1)
+        self.assertEqual(client.calls, 2)
+
+
+class BatchTests(unittest.TestCase):
+    def test_batch_continues_after_a_failure_and_reports(self):
+        import tempfile
+        import batch
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "out")
+            os.makedirs(out)
+            good = os.path.join(tmp, "a.json")
+            bad = os.path.join(tmp, "b.json")
+            with open(good, "w", encoding="utf-8") as f:
+                json.dump({"sourceDocument": "Pro costs $20 per month.", "changes": ["Raise Pro."]}, f)
+            with open(bad, "w", encoding="utf-8") as f:
+                json.dump({"sourceDocument": "Pro costs $20 per month.", "changes": ["Raise Pro."]}, f)
+            ok_resp = json.dumps({"edits": [{"change": 1, "find": "Pro costs $20", "replace": "Pro costs $22"}]})
+            r1 = batch.run_one("a", good, out, ScriptedClient(ok_resp), True, 1)
+            r2 = batch.run_one("b", bad, out, ScriptedClient("x", "x", "x"), True, 1)
+            self.assertTrue(r1["ok"] and not r2["ok"])
+            self.assertTrue(os.path.exists(os.path.join(out, "a.md")))
+            self.assertTrue(os.path.exists(os.path.join(out, "b.fail")))
+            self.assertFalse(os.path.exists(os.path.join(out, "b.md")))
+            summ = batch.report([r1, r2], out, 1.0)
+            self.assertEqual((summ["succeeded"], summ["failed"]), (1, 1))
+
+
+
+
+class RenameAndWideTests(unittest.TestCase):
+    def test_literal_rename_needs_no_model_and_covers_derived_forms(self):
+        src = "Welcome to Nimbus Desk. Nimbus Desk rocks. curl https://api.nimbusdesk.example.com/v2"
+        client = ScriptedClient()
+        doc, st = d.update_document(
+            src, ["Rename the product from Nimbus Desk to Harbor Link everywhere in the guide."], client, workers=1)
+        self.assertEqual(doc, "Welcome to Harbor Link. Harbor Link rocks. curl https://api.harborlink.example.com/v2")
+        self.assertEqual(client.calls, 0)
+        self.assertEqual(st.changes[-1][0]["occurrences"], 3)
+
+    def test_rename_target_missing_is_reported(self):
+        with self.assertRaises(d.UpdateFailed):
+            d.update_document("Nothing here.", ["Rename the product from Foo Bar to Baz Qux everywhere."],
+                              ScriptedClient(), workers=1)
+
+    def test_duplicate_find_is_rejected_for_targeted_instruction(self):
+        src = "If it fails, retry. Later: If it fails, retry."
+        dup = json.dumps({"edits": [{"change": 1, "find": "If it fails, retry.", "replace": "x"}]})
+        client = ScriptedClient(dup, dup, dup)
+        with self.assertRaises(d.UpdateFailed):
+            d.update_document(src, ["Reword the retry advice."], client, workers=1)
+        self.assertEqual(client.calls, d.MAX_ATTEMPTS)
+
+    def test_unknown_capitalised_target_is_skipped_but_new_names_are_fine(self):
+        src = "Basic price $10. Pro price $20."
+        self.assertIn("Platinum", d.check_anchor(src, "Change the Platinum tier price to $999 per month."))
+        self.assertIsNone(d.check_anchor(src, "Change the Pro price to $25."))
+        self.assertIsNone(d.check_anchor(src, "Rename the product from Basic to Zephyr."))
+
+    def test_unrelated_large_deletion_is_rejected(self):
+        src = "Intro text about gardening and weather and many other things here." + NL2 + "Pro costs $20."
+        big = src.split(chr(10))[0]
+        bad = json.dumps({"edits": [{"change": 1, "find": big, "replace": ""}]})
+        good = json.dumps({"edits": [{"change": 1, "find": "Pro costs $20", "replace": "Pro costs $22"}]})
+        client = ScriptedClient(bad, good)
+        d.update_document(src, ["Raise the Pro price by 10%."], client, workers=1)
+        self.assertEqual(client.calls, 2)
 
 
 if __name__ == "__main__":
