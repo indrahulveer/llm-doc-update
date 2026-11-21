@@ -269,6 +269,8 @@ def main(argv=None) -> int:
     ap.add_argument("--highlight", metavar="FILE", help="also write a Markdown review copy: ~~old~~ **new**")
     ap.add_argument("-o", "--output", help="write result JSON here (default: stdout)")
     args = ap.parse_args(argv)
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")   # Windows consoles default to cp1252
 
     def emit(obj, code):
         text = json.dumps(obj, indent=2, ensure_ascii=False)
@@ -292,6 +294,8 @@ def main(argv=None) -> int:
         return emit({"status": "error", "error": f"cannot read input: {type(e).__name__}"}, 1)
     except UpdateFailed as e:
         return emit({"status": "error", "error": str(e)}, 1)
+    except Exception as e:  # unattended runs must always get a clean JSON failure, never a traceback
+        return emit({"status": "error", "error": f"unexpected {type(e).__name__}"}, 1)
     s = stats
     if args.highlight:
         with open(args.highlight, "w", encoding="utf-8") as f:

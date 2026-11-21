@@ -132,7 +132,7 @@ Input tokens, output tokens and latency by request type (N = document words):
 
 | Check | Status |
 |---|---|
-| Unit tests (`python -m unittest discover -s tests -v`): 15 pass | **ran** |
+| Unit tests (`python -m unittest discover -s tests -v`): 16 pass | **ran** |
 | Targeted edit, unrelated text preserved | **ran** (stubbed model) |
 | Malformed JSON, then not-found `find`, then success | **ran** (stubbed model) |
 | Failure after retries exhausted (exactly 3 calls, bounded), one bad chunk fails the job, no-op fails | **ran** (stubbed model) |

@@ -104,6 +104,20 @@ class Tests(unittest.TestCase):
         self.assertEqual(res["status"], "error")
         self.assertNotIn("updatedDocument", res)
 
+    def test_unexpected_error_still_yields_clean_failure(self):
+        out = os.path.join(ROOT, "tests", "_out2.json")
+        orig = d.OpenAIClient
+        d.OpenAIClient = lambda: (_ for _ in ()).throw(RuntimeError("boom"))
+        try:
+            code = d.main([os.path.join(ROOT, "sample_input.json"), "-o", out])
+            with open(out, encoding="utf-8") as f:
+                res = json.load(f)
+        finally:
+            d.OpenAIClient = orig
+            os.path.exists(out) and os.remove(out)
+        self.assertEqual((code, res["status"]), (1, "error"))
+        self.assertNotIn("updatedDocument", res)
+
     def test_readme_semantic_failure_example(self):
         """A wrong-but-valid response passes every check (documented in README)."""
         src = "Basic costs $10 per month. Pro costs $20 per month."
