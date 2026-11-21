@@ -72,6 +72,43 @@ Output for `sample_input.json`:
 
 This lets a human verify the change in seconds, which is also the best defence against the semantically wrong responses described in section 5.
 
+## Requirements compliance
+
+Status key: **Met** means implemented and covered by offline tests with a stubbed model. **Not live-verified** means the real OpenAI call path has never been run (no API key was available while building).
+
+### Functional requirements
+| ID | Requirement | Status | Where / evidence |
+|---|---|---|---|
+| FR-1 | Accept `sourceDocument` string and `changes` array | **Met** | Input is validated in `update_document` and the CLI; bad input gives a clean error |
+| FR-2 | Use an LLM to interpret instructions and produce edits | **Met in code, not live-verified** | `OpenAIClient` and the edit-proposal prompt in `docupdate.py` |
+| FR-3 | Targeted and document-wide changes | **Met (offline)** | `selector.py` routes targeted instructions to BM25-selected windows and document-wide ones to every window; tests `RetrievalTests` |
+| FR-4 | Return the complete updated document | **Met** | Unselected text is passed through byte-for-byte; test asserts the output equals the source with only the intended replacement |
+| FR-5 | Validate model output | **Met** | Schema, verbatim-and-unique `find`, overlap, size sanity, and no-op checks (`parse_edits`, `apply_edits`) |
+| FR-6 | Recover from bad responses; report failure explicitly | **Met per document** | Up to 3 attempts per window with error feedback, plus backoff for API errors; on exhaustion the CLI prints `{"status":"error"}`, exits 1 and returns no document. A batch runner loops over the CLI (see gaps) |
+
+### Non-functional requirements
+| Area | Status | How it is addressed, and what is unproven |
+|---|---|---|
+| Accuracy | **Preservation met; edit correctness not live-verified** | Preservation is verified by test. Whether the model's edits are right needs a live run. Retrieval can silently miss passages (see gaps) |
+| Reliability | **Met by design; not measured** | Detectable errors are caught and retried, and failures are never returned as success. There is no measured comparison against a direct model call |
+| Scalability (about 10k words, unattended) | **Met by design (offline)** | About 7 windows for 10k words, run 4 in parallel; tested up to about 40k words with a stubbed model. One document per CLI invocation |
+| Latency | **By design; not timed live** | Targeted edit: one or two calls, independent of document size. Global edit: about N/1500 calls, 4-way parallel |
+| Token efficiency | **Measured in words sent; not in live tokens** | Targeted edit: constant (about 560 words sent for any size). Global edit: linear in N. See the scaling table in section 3 |
+
+### Submission constraints
+| Constraint | Status |
+|---|---|
+| Script or CLI | Met: `python docupdate.py input.json` |
+| README names a real alternative and why it was rejected | Met: section 3 (full-document rewrite). No switch of approach; retrieval was added to the chosen one |
+| Known failure example that passes all checks | Met: section 5, verified by `test_readme_semantic_failure_example` |
+| 1-2 hour scope, at most 100 MB | Met: a few small source files |
+
+### Known gaps
+1. **No live run:** the OpenAI client, real token counts and real latency are unmeasured.
+2. **No batch runner:** one document per invocation. Unattended runs need a loop over the CLI keyed on the exit code and `status`.
+3. **Silent retrieval misses:** a passage that needs editing but shares no vocabulary with the instruction is skipped without an error. `--no-retrieval` is the safe fallback.
+4. **Partial no-ops:** the no-op check only fires when the whole document is unchanged. If one of several instructions is silently ignored, the run still reports success.
+
 ## 3. Architecture
 
 **Alternative A: full-document rewrite.** Simple, and it is naturally good at global rewrites. But for a 10k-word document, output is about 13k tokens, which takes minutes. Long outputs get truncated or silently drift, and there is no cheap way to prove unrelated text was preserved (you'd have to diff and guess intent). A single failure costs the whole call.
