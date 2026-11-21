@@ -43,6 +43,17 @@ class Tests(unittest.TestCase):
         self.assertTrue(doc.startswith(src[:src.index("Basic")]))
         self.assertEqual((stats.model_calls, stats.retries), (1, 0))
 
+    def test_highlighted_copy_and_changes_list(self):
+        doc, stats = self.run_doc(ScriptedClient(GOOD))
+        self.assertIn("~~Basic costs $10~~**Basic costs $11**", stats.highlighted)
+        self.assertIn("~~Pro costs $20~~**Pro costs $22**", stats.highlighted)
+        self.assertEqual(stats.changes[0][0], {"before": "Basic costs $10", "after": "Basic costs $11"})
+        # stripping the deleted text and the markers must give the updated document (modulo whitespace)
+        import re
+        plain = re.sub(r"~~.*?~~", "", stats.highlighted).replace("**", "")
+        self.assertEqual(" ".join(plain.split()), " ".join(doc.split()))
+        self.assertIn("~~## Legacy API~~", stats.highlighted)
+
     def test_malformed_then_recovery(self):
         client = ScriptedClient("not json {", edits(("text that is not there", "x")), GOOD)
         doc, stats = self.run_doc(client)

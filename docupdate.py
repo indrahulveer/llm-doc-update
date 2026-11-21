@@ -74,8 +74,10 @@ def parse_edits(raw: str) -> list[tuple[str, str]]:
     return out
 
 
-def apply_edits(chunk: str, edits: list[tuple[str, str]]) -> str:
-    """Validate every edit against the chunk, then apply all or raise InvalidEdits."""
+def apply_edits(chunk: str, edits: list[tuple[str, str]], mark: bool = False) -> str:
+    """Validate every edit against the chunk, then apply all or raise InvalidEdits.
+
+    mark=True returns a review copy where each change is shown as ~~old~~**new**."""
     spans = []
     for i, (find, replace) in enumerate(edits):
         if not find:
@@ -97,10 +99,23 @@ def apply_edits(chunk: str, edits: list[tuple[str, str]]) -> str:
             raise InvalidEdits("Two edits overlap. Merge them into one edit.")
     out, pos = [], 0
     for s, e, r in spans:
-        out += [chunk[pos:s], r]
+        out += [chunk[pos:s], (_highlight(chunk[s:e], r) if mark else r)]
         pos = e
     out.append(chunk[pos:])
     return "".join(out)
+
+
+def _highlight(old: str, new: str) -> str:
+    """Markdown review markup: ~~removed~~ **added** (surrounding whitespace kept outside the markers)."""
+    def wrap(text, m):  # mark each line separately so Markdown renders multi-paragraph spans
+        def one(line):
+            core = line.strip()
+            if not core:
+                return line
+            i = line.index(core)
+            return line[:i] + m + core + m + line[i + len(core):]
+        return chr(10).join(one(l) for l in text.split(chr(10)))
+    return wrap(old, "~~") + wrap(new, "**")
 
 
 # --------------------------------------------------------------------------- model client
@@ -174,10 +189,12 @@ class Stats:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     log: list = field(default_factory=list)
+    changes: dict = field(default_factory=dict)   # window idx -> [{before, after}]
+    highlighted: str = ""                         # full document with changes marked up
     lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
 
-def update_chunk(client, chunk: str, changes: list[str], idx: int, stats: Stats) -> tuple[str, int]:
+def update_chunk(client, chunk: str, changes: list[str], idx: int, stats: Stats) -> tuple[str, int, str]:
     messages = build_messages(chunk, changes)
     last_err = ""
     for attempt in range(1, MAX_ATTEMPTS + 1):
@@ -188,7 +205,10 @@ def update_chunk(client, chunk: str, changes: list[str], idx: int, stats: Stats)
             stats.completion_tokens += usage.get("completion_tokens", 0)
         try:
             edits = parse_edits(raw)
-            return apply_edits(chunk, edits), len(edits)
+            new = apply_edits(chunk, edits)
+            with stats.lock:
+                stats.changes[idx] = [{"before": f, "after": r} for f, r in edits if f != r]
+            return new, len(edits), apply_edits(chunk, edits, mark=True)
         except InvalidEdits as e:
             last_err = str(e)
             with stats.lock:
@@ -233,8 +253,9 @@ def update_document(source: str, changes: list[str], client, unit_words: int = s
             for f in futures.values():
                 f.cancel()
             raise
-    stats.edits_applied = sum(n for _, n in done.values())
+    stats.edits_applied = sum(v[1] for v in done.values())
     result = "".join(done[i][0] if i in done else t for i, (t, _) in enumerate(segs))
+    stats.highlighted = "".join(done[i][2] if i in done else t for i, (t, _) in enumerate(segs))
     if result == source:
         raise UpdateFailed("model proposed no effective changes; refusing to report success.")
     return result, stats
@@ -245,6 +266,7 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Apply natural-language changes to a document via OpenAI.")
     ap.add_argument("input", help='JSON file: {"sourceDocument": "...", "changes": ["..."]}')
     ap.add_argument("--no-retrieval", action="store_true", help="send the whole document (full scan)")
+    ap.add_argument("--highlight", metavar="FILE", help="also write a Markdown review copy: ~~old~~ **new**")
     ap.add_argument("-o", "--output", help="write result JSON here (default: stdout)")
     args = ap.parse_args(argv)
 
@@ -271,11 +293,16 @@ def main(argv=None) -> int:
     except UpdateFailed as e:
         return emit({"status": "error", "error": str(e)}, 1)
     s = stats
+    if args.highlight:
+        with open(args.highlight, "w", encoding="utf-8") as f:
+            f.write(s.highlighted)
+    changed = [c for k in sorted(s.changes) for c in s.changes[k]]
     return emit({"status": "ok", "updatedDocument": doc,
                  "stats": {"mode": s.mode, "wordsTotal": s.words_total, "wordsSent": s.words_sent,
                            "windows": s.chunks, "modelCalls": s.model_calls, "retries": s.retries,
                            "editsApplied": s.edits_applied, "promptTokens": s.prompt_tokens,
-                           "completionTokens": s.completion_tokens}}, 0)
+                           "completionTokens": s.completion_tokens},
+                 "changes": changed}, 0)
 
 
 if __name__ == "__main__":

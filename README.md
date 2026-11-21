@@ -11,6 +11,7 @@ $env:OPENAI_API_KEY = "<your key>"        # bash: export OPENAI_API_KEY=...
 python docupdate.py sample_input.json                 # result JSON on stdout
 python docupdate.py sample_input.json -o result.json  # or to a file (atomic write)
 python docupdate.py sample_input.json --no-retrieval  # force a full-document scan
+python docupdate.py sample_input.json --highlight review.md   # also write a Markdown review copy of the changes
 
 python -m unittest discover -s tests -v               # tests; no API key needed
 ```
@@ -27,7 +28,8 @@ Input:
 Success (exit code 0):
 ```json
 {"status": "ok", "updatedDocument": "...", "stats": {"mode": "targeted", "wordsTotal": 9931, "wordsSent": 558, "windows": 1, "modelCalls": 1, "retries": 0,
-  "editsApplied": 12, "promptTokens": 0, "completionTokens": 0}}
+  "editsApplied": 12, "promptTokens": 0, "completionTokens": 0},
+ "changes": [{"before": "Basic costs $10", "after": "Basic costs $11"}]}
 ```
 
 Failure (exit code 1). There is **no** `updatedDocument` field, and nothing partial is written:
@@ -35,6 +37,40 @@ Failure (exit code 1). There is **no** `updatedDocument` field, and nothing part
 {"status": "error", "error": "chunk 3 failed after 3 attempts; last error: edits[0].find does not occur verbatim ..."}
 ```
 Failure cases: a missing key, a bad input, persistent API errors, a chunk still invalid after retries, or a model that produced no effective change at all. A no-op is treated as failure because it's usually a silent miss. A batch runner can key on the exit code and `status`.
+
+## Techniques used (summary)
+
+| Stage | Technique | Kind | LLM tokens? |
+|---|---|---|---|
+| Segmentation | Paragraph-aligned units (about 250 words) | rule-based NLP | none |
+| Normalisation | Lowercasing, tokenisation, stop-word and editing-verb removal, light suffix stemming | classical NLP | none |
+| Relevance | **BM25** ranking of units against each instruction (query-focused filtering) | information retrieval | none |
+| Context | Neighbour units, and whole-section expansion from matched markdown headings | document-structure heuristics | small |
+| Routing | Regex markers for document-wide instructions (tone, style, "throughout", ...), and zero-hit fallback to a full scan | rule-based | none |
+| Editing | LLM proposes `{find, replace}` edits (structured JSON output, temperature 0) | LLM | only relevant windows |
+| Verification | Schema check, verbatim-and-unique anchor match, overlap check, size sanity check | programmatic validation | none |
+| Recovery | Error-feedback retry (max 3 per window) and backoff for 429/5xx/network | bounded retry | only the failed window |
+| Review | Change highlighting (see below) | diff-style markup | none |
+
+## Highlighting changes
+
+Every run reports exactly what changed. This comes from the validated edits themselves, not from diffing afterwards.
+- The JSON output has a `changes` list of `{before, after}` pairs (no-op edits are dropped).
+- `--highlight review.md` writes the full document with each change marked as `~~removed~~` and `**added**`. Each line is marked separately, so multi-paragraph deletions render correctly in Markdown.
+
+Output for `sample_input.json`:
+
+```markdown
+## Pricing
+
+~~Basic costs $10~~**Basic costs $11** per month. ~~Pro costs $20~~**Pro costs $22** per month. ~~Enterprise costs $100~~**Enterprise costs $110** per month.
+
+~~## Legacy API~~
+
+~~The legacy API (v1) is deprecated and will be removed next year.~~
+```
+
+This lets a human verify the change in seconds, which is also the best defence against the semantically wrong responses described in section 5.
 
 ## 3. Architecture
 
@@ -96,12 +132,13 @@ Input tokens, output tokens and latency by request type (N = document words):
 
 | Check | Status |
 |---|---|
-| Unit tests (`python -m unittest discover -s tests -v`): 14 pass | **ran** |
+| Unit tests (`python -m unittest discover -s tests -v`): 15 pass | **ran** |
 | Targeted edit, unrelated text preserved | **ran** (stubbed model) |
 | Malformed JSON, then not-found `find`, then success | **ran** (stubbed model) |
 | Failure after retries exhausted (exactly 3 calls, bounded), one bad chunk fails the job, no-op fails | **ran** (stubbed model) |
 | CLI exit code 1 and no document on failure (no key set) | **ran** |
 | Retrieval: targeted edit sends under 15% of a 5k-word doc, `words_sent` is constant as the doc grows 4x, global instruction sends every window, zero-hit falls back to full scan, heading pulls in its section | **ran** (stubbed model) |
+| Highlight/changes output: markup is correct, and stripping it reproduces the updated document | **ran** (stubbed model) |
 | Live OpenAI smoke test | **not run**: no `OPENAI_API_KEY` was configured in this environment |
 
 The live path (`OpenAIClient`) is therefore untested against the real API. Run `python docupdate.py sample_input.json` with a key to check it.
